@@ -1,0 +1,17 @@
+{
+  "name": "yaml-caret",
+  "version": "0.1.0",
+  "description": "A validating YAML parser and pretty printer with precise, caret-pointed error messages.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p .",
+    "start": "node dist/index.js"
+  },
+  "license": "MIT",
+  "author": "nancyw99",
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.5.0"
+  }
+}
