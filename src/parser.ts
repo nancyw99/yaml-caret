@@ -2,10 +2,10 @@
 // error messages that point at the exact line and column that went wrong.
 //
 // Deliberately out of scope for now: flow collections ([a, b], {k: v}),
-// anchors/aliases, block scalars (| and >), and multi-document streams
-// beyond a single leading "---". Those are real YAML features that a lot
-// of config files never touch; better to get the common 90% right with
-// good diagnostics than to half-support everything.
+// anchors/aliases, and multi-document streams beyond a single leading
+// "---". Those are real YAML features that a lot of config files never
+// touch; better to get the common 90% right with good diagnostics than
+// to half-support everything.
 
 export type YamlScalar = string | number | boolean | null;
 export type YamlValue = YamlScalar | YamlValue[] | { [key: string]: YamlValue };
@@ -56,6 +56,18 @@ interface SourceLine {
   raw: string; // the original full line, kept for error display
   indent: number; // count of leading spaces
   content: string; // text after indentation, trailing comment stripped, right-trimmed
+  tabColumn: number | null; // 1-based column of a leading tab, if any; checked lazily so tabs
+  // inside block scalar content (read straight from rawLines, never through this struct) are fine
+}
+
+function splitLines(source: string): string[] {
+  return source.split(/\r\n|\r|\n/);
+}
+
+function checkNoTab(line: SourceLine): void {
+  if (line.tabColumn !== null) {
+    throw new YamlParseError('tab characters are not allowed for indentation', line.number, line.tabColumn, line.raw);
+  }
 }
 
 // Removes a trailing "# comment" from a line without being fooled by
@@ -99,22 +111,23 @@ function stripComment(raw: string): string {
 }
 
 function toSourceLines(source: string): SourceLine[] {
-  const rawLines = source.split(/\r\n|\r|\n/);
+  const rawLines = splitLines(source);
   const lines: SourceLine[] = [];
   for (let i = 0; i < rawLines.length; i++) {
     const raw = rawLines[i];
     const number = i + 1;
     const stripped = stripComment(raw);
     let indent = 0;
+    let tabColumn: number | null = null;
     while (indent < stripped.length && (stripped[indent] === ' ' || stripped[indent] === '\t')) {
-      if (stripped[indent] === '\t') {
-        throw new YamlParseError('tab characters are not allowed for indentation', number, indent + 1, raw);
+      if (stripped[indent] === '\t' && tabColumn === null) {
+        tabColumn = indent + 1;
       }
       indent++;
     }
     const content = stripped.slice(indent).replace(/\s+$/, '');
     if (content.length === 0) continue; // blank or comment-only line
-    lines.push({ number, raw, indent, content });
+    lines.push({ number, raw, indent, content, tabColumn });
   }
   return lines;
 }
@@ -260,27 +273,137 @@ function parseScalarText(text: string, line: number, column: number, raw: string
   return parsePlainScalar(text);
 }
 
-function parseNode(lines: SourceLine[], pos: number): [YamlValue, number] {
-  const indent = lines[pos].indent;
-  return parseNodeAt(lines, pos, indent);
+// Header of a block scalar introducer such as "|", ">-", "|2+".
+interface BlockScalarHeader {
+  style: '|' | '>';
+  chomping: 'clip' | 'strip' | 'keep';
+  indent: number | null; // explicit indentation indicator, relative to the parent indent
 }
 
-function parseNodeAt(lines: SourceLine[], pos: number, indent: number): [YamlValue, number] {
+function parseBlockScalarHeader(text: string): BlockScalarHeader | null {
+  const m = /^([|>])([+\-0-9]{0,2})$/.exec(text);
+  if (!m) return null;
+  const style = m[1] as '|' | '>';
+  let chomping: 'clip' | 'strip' | 'keep' = 'clip';
+  let indent: number | null = null;
+  for (const ch of m[2]) {
+    if (ch === '-' || ch === '+') {
+      if (chomping !== 'clip') return null; // chomping indicator given twice
+      chomping = ch === '-' ? 'strip' : 'keep';
+    } else {
+      if (indent !== null) return null; // indentation indicator given twice
+      indent = parseInt(ch, 10);
+      if (indent === 0) return null; // "0" is not a valid indentation indicator
+    }
+  }
+  return { style, chomping, indent };
+}
+
+// Reads a block scalar's raw lines directly from the source (not the filtered
+// SourceLine list, since blank lines inside the scalar are significant and were
+// already dropped by toSourceLines). Returns the decoded string and the line
+// number of the last raw line consumed, so the caller can resume from there.
+function parseBlockScalar(
+  rawLines: string[],
+  headerLineNumber: number,
+  parentIndent: number,
+  header: BlockScalarHeader,
+): { text: string; lastLine: number } {
+  let determinedIndent = header.indent !== null ? parentIndent + header.indent : null;
+  const entries: { text: string; blank: boolean; moreIndented: boolean }[] = [];
+  let lastLine = headerLineNumber;
+  let cursor = headerLineNumber; // rawLines is 0-based, so this already points past the header line
+
+  while (cursor < rawLines.length) {
+    const raw = rawLines[cursor];
+    if (/^[ \t]*$/.test(raw)) {
+      entries.push({ text: '', blank: true, moreIndented: false });
+      lastLine = cursor + 1;
+      cursor++;
+      continue;
+    }
+    let lineIndent = 0;
+    while (lineIndent < raw.length && raw[lineIndent] === ' ') lineIndent++;
+    if (determinedIndent === null) {
+      if (lineIndent <= parentIndent) break;
+      determinedIndent = lineIndent;
+    } else if (lineIndent < determinedIndent) {
+      break;
+    }
+    entries.push({ text: raw.slice(determinedIndent), blank: false, moreIndented: lineIndent > determinedIndent });
+    lastLine = cursor + 1;
+    cursor++;
+  }
+
+  const n = entries.length;
+  let body: string;
+  if (header.style === '|') {
+    body = entries.map((e) => e.text).join('\n');
+  } else {
+    let out = '';
+    for (let i = 0; i < n; i++) {
+      out += entries[i].text;
+      if (i === n - 1) break;
+      const cur = entries[i];
+      const next = entries[i + 1];
+      out += cur.blank || next.blank || cur.moreIndented || next.moreIndented ? '\n' : ' ';
+    }
+    body = out;
+  }
+
+  const trimmed = body.replace(/\n+$/, '');
+  let text: string;
+  if (header.chomping === 'strip') text = trimmed;
+  else if (header.chomping === 'keep') text = n > 0 ? body + '\n' : '';
+  else text = n > 0 ? trimmed + '\n' : '';
+
+  return { text, lastLine };
+}
+
+// Advances past every filtered line that belongs to a raw line range already
+// consumed elsewhere (block scalar content), landing on the first line after it.
+function findLineIndexAfter(lines: SourceLine[], fromPos: number, rawLineNumber: number): number {
+  let i = fromPos;
+  while (i < lines.length && lines[i].number <= rawLineNumber) i++;
+  return i;
+}
+
+function parseNode(lines: SourceLine[], pos: number, rawLines: string[]): [YamlValue, number] {
+  const indent = lines[pos].indent;
+  return parseNodeAt(lines, pos, indent, rawLines);
+}
+
+function parseNodeAt(lines: SourceLine[], pos: number, indent: number, rawLines: string[]): [YamlValue, number] {
   const line = lines[pos];
+  checkNoTab(line);
   if (isSeqMarker(line.content)) {
-    return parseSequence(lines, pos, indent);
+    return parseSequence(lines, pos, indent, rawLines);
   }
   if (findTopLevelColon(line.content) !== -1) {
-    return parseMapping(lines, pos, indent);
+    return parseMapping(lines, pos, indent, rawLines);
+  }
+  if (line.content[0] === '|' || line.content[0] === '>') {
+    const header = parseBlockScalarHeader(line.content);
+    if (!header) {
+      throw new YamlParseError(`invalid block scalar header "${line.content}"`, line.number, line.indent + 1, line.raw);
+    }
+    const block = parseBlockScalar(rawLines, line.number, indent, header);
+    return [block.text, findLineIndexAfter(lines, pos + 1, block.lastLine)];
   }
   const value = parseScalarText(line.content, line.number, line.indent + 1, line.raw);
   return [value, pos + 1];
 }
 
-function parseSequence(lines: SourceLine[], pos: number, indent: number): [YamlValue[], number] {
+function parseSequence(
+  lines: SourceLine[],
+  pos: number,
+  indent: number,
+  rawLines: string[],
+): [YamlValue[], number] {
   const result: YamlValue[] = [];
   while (pos < lines.length && lines[pos].indent === indent && isSeqMarker(lines[pos].content)) {
     const line = lines[pos];
+    checkNoTab(line);
     const rest = line.content.slice(1);
     const restTrimmed = rest.replace(/^ +/, '');
     const leadingSpaces = rest.length - restTrimmed.length;
@@ -289,7 +412,7 @@ function parseSequence(lines: SourceLine[], pos: number, indent: number): [YamlV
     if (restTrimmed.length === 0) {
       pos++;
       if (pos < lines.length && lines[pos].indent > indent) {
-        const [value, next] = parseNode(lines, pos);
+        const [value, next] = parseNode(lines, pos, rawLines);
         result.push(value);
         pos = next;
       } else {
@@ -306,12 +429,21 @@ function parseSequence(lines: SourceLine[], pos: number, indent: number): [YamlV
         raw: line.raw,
         indent: itemColumn - 1,
         content: restTrimmed,
+        tabColumn: null,
       };
       const withSynthetic = lines.slice();
       withSynthetic[pos] = synthetic;
-      const [value, next] = parseMapping(withSynthetic, pos, synthetic.indent);
+      const [value, next] = parseMapping(withSynthetic, pos, synthetic.indent, rawLines);
       result.push(value);
       pos = next;
+    } else if (restTrimmed[0] === '|' || restTrimmed[0] === '>') {
+      const header = parseBlockScalarHeader(restTrimmed);
+      if (!header) {
+        throw new YamlParseError(`invalid block scalar header "${restTrimmed}"`, line.number, itemColumn, line.raw);
+      }
+      const block = parseBlockScalar(rawLines, line.number, indent, header);
+      result.push(block.text);
+      pos = findLineIndexAfter(lines, pos + 1, block.lastLine);
     } else {
       const value = parseScalarText(restTrimmed, line.number, itemColumn, line.raw);
       result.push(value);
@@ -321,12 +453,18 @@ function parseSequence(lines: SourceLine[], pos: number, indent: number): [YamlV
   return [result, pos];
 }
 
-function parseMapping(lines: SourceLine[], pos: number, indent: number): [Record<string, YamlValue>, number] {
+function parseMapping(
+  lines: SourceLine[],
+  pos: number,
+  indent: number,
+  rawLines: string[],
+): [Record<string, YamlValue>, number] {
   const result: Record<string, YamlValue> = {};
   const keyLocations = new Map<string, { line: number; column: number; raw: string }>();
 
   while (pos < lines.length && lines[pos].indent === indent && !isSeqMarker(lines[pos].content)) {
     const line = lines[pos];
+    checkNoTab(line);
     const colonIdx = findTopLevelColon(line.content);
     if (colonIdx === -1) {
       throw new YamlParseError('expected "key: value"', line.number, line.indent + 1, line.raw);
@@ -361,7 +499,7 @@ function parseMapping(lines: SourceLine[], pos: number, indent: number): [Record
     if (valueOffset === -1) {
       pos++;
       if (pos < lines.length && lines[pos].indent > indent) {
-        const [value, next] = parseNode(lines, pos);
+        const [value, next] = parseNode(lines, pos, rawLines);
         result[key] = value;
         pos = next;
       } else {
@@ -372,6 +510,18 @@ function parseMapping(lines: SourceLine[], pos: number, indent: number): [Record
 
     const valueText = afterColon.slice(valueOffset).replace(/\s+$/, '');
     const valueColumn = line.indent + colonIdx + 2 + valueOffset;
+
+    if (valueText[0] === '|' || valueText[0] === '>') {
+      const header = parseBlockScalarHeader(valueText);
+      if (!header) {
+        throw new YamlParseError(`invalid block scalar header "${valueText}"`, line.number, valueColumn, line.raw);
+      }
+      const block = parseBlockScalar(rawLines, line.number, indent, header);
+      result[key] = block.text;
+      pos = findLineIndexAfter(lines, pos + 1, block.lastLine);
+      continue;
+    }
+
     result[key] = parseScalarText(valueText, line.number, valueColumn, line.raw);
     pos++;
   }
@@ -381,6 +531,7 @@ function parseMapping(lines: SourceLine[], pos: number, indent: number): [Record
 
 export function parseYaml(source: string): YamlValue {
   const lines = toSourceLines(source);
+  const rawLines = splitLines(source);
   let pos = 0;
 
   if (pos < lines.length && lines[pos].content === '---') {
@@ -390,7 +541,7 @@ export function parseYaml(source: string): YamlValue {
     return null;
   }
 
-  const [value, next] = parseNode(lines, pos);
+  const [value, next] = parseNode(lines, pos, rawLines);
   let end = next;
   if (end < lines.length && lines[end].content === '...') {
     end++;

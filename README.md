@@ -106,12 +106,13 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 - `null`, `true`/`false`, integers, and floats, recognized by value
 - Comments (`#`, respecting quotes)
 - A single leading `---` document marker and a single trailing `...`
+- Block scalars, literal (`|`) and folded (`>`), with chomping indicators
+  (`-` strip, `+` keep) and an explicit indentation indicator (e.g. `|2`)
 
 ## What's not supported yet
 
 - Flow collections: `[a, b]` and `{k: v}`
 - Anchors and aliases (`&name`, `*name`)
-- Block scalars (`|` and `>`)
 - Multiple documents in one stream
 - Schema validation beyond "this is structurally valid YAML" — the parser
   checks syntax, not your application's shape
