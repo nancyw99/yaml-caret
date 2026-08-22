@@ -101,6 +101,8 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 
 - Block mappings and sequences, including `- key: value` inline sequence
   items and arbitrarily nested indentation
+- Flow collections, `[a, b]` and `{k: v}`, including nesting (`[{a: 1}]`),
+  anywhere a value is expected — but each one must fit on a single line
 - Plain, single-quoted, and double-quoted scalars, with standard escapes
   in double-quoted strings
 - `null`, `true`/`false`, integers, and floats, recognized by value
@@ -111,7 +113,7 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 
 ## What's not supported yet
 
-- Flow collections: `[a, b]` and `{k: v}`
+- Multi-line flow collections
 - Anchors and aliases (`&name`, `*name`)
 - Multiple documents in one stream
 - Schema validation beyond "this is structurally valid YAML" — the parser

@@ -1,11 +1,12 @@
 // A block-style YAML parser (mappings, sequences, scalars, comments) with
 // error messages that point at the exact line and column that went wrong.
+// Flow collections ([a, b], {k: v}) are supported inline within otherwise
+// block-style documents, but must fit on a single line.
 //
-// Deliberately out of scope for now: flow collections ([a, b], {k: v}),
-// anchors/aliases, and multi-document streams beyond a single leading
-// "---". Those are real YAML features that a lot of config files never
-// touch; better to get the common 90% right with good diagnostics than
-// to half-support everything.
+// Deliberately out of scope for now: anchors/aliases, and multi-document
+// streams beyond a single leading "---". Those are real YAML features that
+// a lot of config files never touch; better to get the common 90% right
+// with good diagnostics than to half-support everything.
 
 export type YamlScalar = string | number | boolean | null;
 export type YamlValue = YamlScalar | YamlValue[] | { [key: string]: YamlValue };
@@ -141,6 +142,7 @@ function isSeqMarker(content: string): boolean {
 function findTopLevelColon(content: string): number {
   let inSingle = false;
   let inDouble = false;
+  let depth = 0; // bracket nesting, so a ':' inside a flow collection isn't mistaken for a mapping
   for (let i = 0; i < content.length; i++) {
     const c = content[i];
     if (inSingle) {
@@ -169,50 +171,66 @@ function findTopLevelColon(content: string): number {
       inDouble = true;
       continue;
     }
-    if (c === ':' && (i === content.length - 1 || content[i + 1] === ' ')) {
+    if (c === '[' || c === '{') {
+      depth++;
+      continue;
+    }
+    if (c === ']' || c === '}') {
+      if (depth > 0) depth--;
+      continue;
+    }
+    if (c === ':' && depth === 0 && (i === content.length - 1 || content[i + 1] === ' ')) {
       return i;
     }
   }
   return -1;
 }
 
-function parseDoubleQuoted(text: string, line: number, column: number, raw: string): string {
+// Reads a double-quoted scalar starting at text[start] (which must be '"'),
+// stopping at the matching close quote rather than requiring it to be the
+// last character in `text` — so the same reader works for a standalone
+// scalar and for one embedded inside a flow collection followed by more
+// content. `column` is the source column of text[0].
+function readDoubleQuoted(
+  text: string,
+  start: number,
+  line: number,
+  column: number,
+  raw: string,
+): { value: string; end: number } {
   let result = '';
-  for (let i = 1; i < text.length; i++) {
+  let i = start + 1;
+  while (i < text.length) {
     const c = text[i];
     if (c === '"') {
-      const rest = text.slice(i + 1).trim();
-      if (rest.length > 0) {
-        throw new YamlParseError(`unexpected characters after closing quote: "${rest}"`, line, column + i, raw);
-      }
-      return result;
+      return { value: result, end: i + 1 };
     }
     if (c === '\\') {
       const next = text[i + 1];
       switch (next) {
         case 'n':
           result += '\n';
-          i++;
+          i += 2;
           break;
         case 't':
           result += '\t';
-          i++;
+          i += 2;
           break;
         case 'r':
           result += '\r';
-          i++;
+          i += 2;
           break;
         case '"':
           result += '"';
-          i++;
+          i += 2;
           break;
         case '\\':
           result += '\\';
-          i++;
+          i += 2;
           break;
         case '0':
           result += '\0';
-          i++;
+          i += 2;
           break;
         case 'u': {
           const hex = text.slice(i + 2, i + 6);
@@ -220,7 +238,7 @@ function parseDoubleQuoted(text: string, line: number, column: number, raw: stri
             throw new YamlParseError('invalid \\u escape sequence', line, column + i, raw);
           }
           result += String.fromCharCode(parseInt(hex, 16));
-          i += 5;
+          i += 6;
           break;
         }
         default:
@@ -229,29 +247,54 @@ function parseDoubleQuoted(text: string, line: number, column: number, raw: stri
       continue;
     }
     result += c;
+    i++;
   }
-  throw new YamlParseError('unterminated double-quoted string', line, column, raw);
+  throw new YamlParseError('unterminated double-quoted string', line, column + start, raw);
 }
 
-function parseSingleQuoted(text: string, line: number, column: number, raw: string): string {
+// Same idea as readDoubleQuoted, for single-quoted scalars ('' is the
+// escape for a literal quote).
+function readSingleQuoted(
+  text: string,
+  start: number,
+  line: number,
+  column: number,
+  raw: string,
+): { value: string; end: number } {
   let result = '';
-  for (let i = 1; i < text.length; i++) {
+  let i = start + 1;
+  while (i < text.length) {
     const c = text[i];
     if (c === "'") {
       if (text[i + 1] === "'") {
         result += "'";
-        i++;
+        i += 2;
         continue;
       }
-      const rest = text.slice(i + 1).trim();
-      if (rest.length > 0) {
-        throw new YamlParseError(`unexpected characters after closing quote: "${rest}"`, line, column + i, raw);
-      }
-      return result;
+      return { value: result, end: i + 1 };
     }
     result += c;
+    i++;
   }
-  throw new YamlParseError('unterminated single-quoted string', line, column, raw);
+  throw new YamlParseError('unterminated single-quoted string', line, column + start, raw);
+}
+
+function parseDoubleQuoted(text: string, line: number, column: number, raw: string): string {
+  const { value, end } = readDoubleQuoted(text, 0, line, column, raw);
+  const rest = text.slice(end).trim();
+  if (rest.length > 0) {
+    throw new YamlParseError(`unexpected characters after closing quote: "${rest}"`, line, column + end - 1, raw);
+  }
+  return value;
+}
+
+function parseSingleQuoted(text: string, line: number, column: number, raw: string): string {
+  const { value, end } = readSingleQuoted(text, 0, line, column, raw);
+  const rest = text.slice(end).trim();
+  if (rest.length > 0) {
+    throw new YamlParseError(`unexpected characters after closing quote: "${rest}"`, line, column + end - 1, raw);
+  }
+  return value;
 }
 
 function parsePlainScalar(text: string): YamlValue {
@@ -271,6 +314,193 @@ function parseScalarText(text: string, line: number, column: number, raw: string
   if (text[0] === '"') return parseDoubleQuoted(text, line, column, raw);
   if (text[0] === "'") return parseSingleQuoted(text, line, column, raw);
   return parsePlainScalar(text);
+}
+
+// A flow collection ([a, b] or {k: v}) is parsed on a single line with its
+// own cursor, independent of the block indentation rules. `pos` is an index
+// into `text`; `column` is the source column of text[0].
+interface FlowCursor {
+  text: string;
+  pos: number;
+}
+
+function skipFlowSpace(cursor: FlowCursor): void {
+  while (cursor.pos < cursor.text.length && cursor.text[cursor.pos] === ' ') cursor.pos++;
+}
+
+// Reads a run of plain (unquoted) flow text, stopping before any flow
+// indicator: ',', '[', ']', '{', '}', or a ':' that looks like a mapping
+// separator (followed by space, a delimiter, or end of text).
+function readFlowPlainSpan(cursor: FlowCursor): string {
+  const start = cursor.pos;
+  const text = cursor.text;
+  while (cursor.pos < text.length) {
+    const c = text[cursor.pos];
+    if (c === ',' || c === '[' || c === ']' || c === '{' || c === '}') break;
+    if (c === ':') {
+      const next = text[cursor.pos + 1];
+      if (next === undefined || next === ' ' || next === ',' || next === ']' || next === '}') break;
+    }
+    cursor.pos++;
+  }
+  return text.slice(start, cursor.pos).replace(/\s+$/, '');
+}
+
+function parseFlowPlainScalar(cursor: FlowCursor, line: number, column: number, raw: string): YamlValue {
+  const startPos = cursor.pos;
+  const text = readFlowPlainSpan(cursor);
+  if (text.length === 0) {
+    throw new YamlParseError('expected a value', line, column + startPos, raw);
+  }
+  return parsePlainScalar(text);
+}
+
+// Flow mapping keys keep their literal text when unquoted, matching how
+// block mapping keys are handled: only a quoted key goes through scalar
+// type coercion.
+function readFlowKeyText(cursor: FlowCursor, line: number, column: number, raw: string): string {
+  const c = cursor.text[cursor.pos];
+  if (c === '"') return readDoubleQuoted(cursor.text, cursor.pos, line, column, raw).value;
+  if (c === "'") return readSingleQuoted(cursor.text, cursor.pos, line, column, raw).value;
+  const startPos = cursor.pos;
+  const text = readFlowPlainSpan(cursor);
+  if (text.length === 0) {
+    throw new YamlParseError('expected a mapping key', line, column + startPos, raw);
+  }
+  return text;
+}
+
+function parseFlowNode(cursor: FlowCursor, line: number, column: number, raw: string): YamlValue {
+  skipFlowSpace(cursor);
+  const c = cursor.text[cursor.pos];
+  if (c === '[') return parseFlowSequence(cursor, line, column, raw);
+  if (c === '{') return parseFlowMapping(cursor, line, column, raw);
+  if (c === '"') {
+    const { value, end } = readDoubleQuoted(cursor.text, cursor.pos, line, column, raw);
+    cursor.pos = end;
+    return value;
+  }
+  if (c === "'") {
+    const { value, end } = readSingleQuoted(cursor.text, cursor.pos, line, column, raw);
+    cursor.pos = end;
+    return value;
+  }
+  return parseFlowPlainScalar(cursor, line, column, raw);
+}
+
+function parseFlowSequence(cursor: FlowCursor, line: number, column: number, raw: string): YamlValue[] {
+  cursor.pos++; // consume '['
+  const result: YamlValue[] = [];
+  skipFlowSpace(cursor);
+  if (cursor.text[cursor.pos] === ']') {
+    cursor.pos++;
+    return result;
+  }
+  while (true) {
+    result.push(parseFlowNode(cursor, line, column, raw));
+    skipFlowSpace(cursor);
+    const c = cursor.text[cursor.pos];
+    if (c === ',') {
+      cursor.pos++;
+      skipFlowSpace(cursor);
+      if (cursor.text[cursor.pos] === ']') {
+        cursor.pos++;
+        return result;
+      }
+      continue;
+    }
+    if (c === ']') {
+      cursor.pos++;
+      return result;
+    }
+    if (c === undefined) {
+      throw new YamlParseError('unterminated flow sequence, expected "]"', line, column + cursor.pos, raw);
+    }
+    throw new YamlParseError('expected "," or "]" in flow sequence', line, column + cursor.pos, raw);
+  }
+}
+
+function parseFlowMapping(cursor: FlowCursor, line: number, column: number, raw: string): Record<string, YamlValue> {
+  cursor.pos++; // consume '{'
+  const result: Record<string, YamlValue> = {};
+  const keyLocations = new Map<string, { line: number; column: number; raw: string }>();
+  skipFlowSpace(cursor);
+  if (cursor.text[cursor.pos] === '}') {
+    cursor.pos++;
+    return result;
+  }
+  while (true) {
+    skipFlowSpace(cursor);
+    const keyColumn = column + cursor.pos;
+    const key = readFlowKeyText(cursor, line, column, raw);
+    skipFlowSpace(cursor);
+
+    let value: YamlValue = null;
+    if (cursor.text[cursor.pos] === ':') {
+      const next = cursor.text[cursor.pos + 1];
+      if (next === undefined || next === ' ' || next === ',' || next === '}' || next === ']') {
+        cursor.pos++;
+        skipFlowSpace(cursor);
+        value = parseFlowNode(cursor, line, column, raw);
+      }
+    }
+
+    const existing = keyLocations.get(key);
+    if (existing) {
+      throw new YamlParseError(`duplicate key "${key}"`, line, keyColumn, raw, {
+        message: 'note: first defined here',
+        line: existing.line,
+        column: existing.column,
+        raw: existing.raw,
+      });
+    }
+    keyLocations.set(key, { line, column: keyColumn, raw });
+    result[key] = value;
+
+    skipFlowSpace(cursor);
+    const sep = cursor.text[cursor.pos];
+    if (sep === ',') {
+      cursor.pos++;
+      skipFlowSpace(cursor);
+      if (cursor.text[cursor.pos] === '}') {
+        cursor.pos++;
+        return result;
+      }
+      continue;
+    }
+    if (sep === '}') {
+      cursor.pos++;
+      return result;
+    }
+    if (sep === undefined) {
+      throw new YamlParseError('unterminated flow mapping, expected "}"', line, column + cursor.pos, raw);
+    }
+    throw new YamlParseError('expected "," or "}" in flow mapping', line, column + cursor.pos, raw);
+  }
+}
+
+function parseFlowRoot(text: string, line: number, column: number, raw: string): YamlValue {
+  const cursor: FlowCursor = { text, pos: 0 };
+  const value = parseFlowNode(cursor, line, column, raw);
+  skipFlowSpace(cursor);
+  if (cursor.pos < text.length) {
+    throw new YamlParseError(
+      `unexpected characters after flow collection: "${text.slice(cursor.pos)}"`,
+      line,
+      column + cursor.pos,
+      raw,
+    );
+  }
+  return value;
+}
+
+// Resolves a value's source text to a YamlValue, dispatching to the flow
+// collection parser when the text opens with a flow indicator.
+function parseValueText(text: string, line: number, column: number, raw: string): YamlValue {
+  if (text[0] === '[' || text[0] === '{') {
+    return parseFlowRoot(text, line, column, raw);
+  }
+  return parseScalarText(text, line, column, raw);
 }
 
 // Header of a block scalar introducer such as "|", ">-", "|2+".
@@ -390,7 +620,7 @@ function parseNodeAt(lines: SourceLine[], pos: number, indent: number, rawLines:
     const block = parseBlockScalar(rawLines, line.number, indent, header);
     return [block.text, findLineIndexAfter(lines, pos + 1, block.lastLine)];
   }
-  const value = parseScalarText(line.content, line.number, line.indent + 1, line.raw);
+  const value = parseValueText(line.content, line.number, line.indent + 1, line.raw);
   return [value, pos + 1];
 }
 
@@ -445,7 +675,7 @@ function parseSequence(
       result.push(block.text);
       pos = findLineIndexAfter(lines, pos + 1, block.lastLine);
     } else {
-      const value = parseScalarText(restTrimmed, line.number, itemColumn, line.raw);
+      const value = parseValueText(restTrimmed, line.number, itemColumn, line.raw);
       result.push(value);
       pos++;
     }
@@ -522,7 +752,7 @@ function parseMapping(
       continue;
     }
 
-    result[key] = parseScalarText(valueText, line.number, valueColumn, line.raw);
+    result[key] = parseValueText(valueText, line.number, valueColumn, line.raw);
     pos++;
   }
 
