@@ -3,10 +3,16 @@
 // Flow collections ([a, b], {k: v}) are supported inline within otherwise
 // block-style documents, but must fit on a single line.
 //
-// Deliberately out of scope for now: anchors/aliases, and multi-document
-// streams beyond a single leading "---". Those are real YAML features that
-// a lot of config files never touch; better to get the common 90% right
-// with good diagnostics than to half-support everything.
+// Anchors (&name) and aliases (*name) are supported for whole nodes: a
+// mapping value, a sequence item, or the document root. An anchor written
+// immediately before an inline "- key: value" sequence shorthand is also
+// handled. Not supported: anchors on mapping keys, merge keys ("<<"), and
+// aliases inside flow collections.
+//
+// Deliberately out of scope for now: multi-document streams beyond a
+// single leading "---". That's a real YAML feature that a lot of config
+// files never touch; better to get the common 90% right with good
+// diagnostics than to half-support everything.
 
 export type YamlScalar = string | number | boolean | null;
 export type YamlValue = YamlScalar | YamlValue[] | { [key: string]: YamlValue };
@@ -598,19 +604,71 @@ function findLineIndexAfter(lines: SourceLine[], fromPos: number, rawLineNumber:
   return i;
 }
 
-function parseNode(lines: SourceLine[], pos: number, rawLines: string[]): [YamlValue, number] {
+// An anchor or alias name: anything but whitespace and flow indicators.
+const ANCHOR_NAME = '[^\\s,\\[\\]{}]+';
+const ALIAS_RE = new RegExp(`^\\*(${ANCHOR_NAME})$`);
+const ANCHOR_RE = new RegExp(`^&(${ANCHOR_NAME})(?:\\s+(.*))?$`);
+
+function parseNode(
+  lines: SourceLine[],
+  pos: number,
+  rawLines: string[],
+  anchors: Map<string, YamlValue>,
+): [YamlValue, number] {
   const indent = lines[pos].indent;
-  return parseNodeAt(lines, pos, indent, rawLines);
+  return parseNodeAt(lines, pos, indent, rawLines, anchors);
 }
 
-function parseNodeAt(lines: SourceLine[], pos: number, indent: number, rawLines: string[]): [YamlValue, number] {
+function parseNodeAt(
+  lines: SourceLine[],
+  pos: number,
+  indent: number,
+  rawLines: string[],
+  anchors: Map<string, YamlValue>,
+): [YamlValue, number] {
   const line = lines[pos];
   checkNoTab(line);
+
+  const aliasMatch = ALIAS_RE.exec(line.content);
+  if (aliasMatch) {
+    return [resolveAlias(aliasMatch[1], line.number, line.indent + 1, line.raw, anchors), pos + 1];
+  }
+
+  const anchorMatch = ANCHOR_RE.exec(line.content);
+  if (anchorMatch) {
+    const anchorName = anchorMatch[1];
+    const rest = anchorMatch[2];
+    let value: YamlValue;
+    let next: number;
+    if (rest === undefined) {
+      if (pos + 1 < lines.length && lines[pos + 1].indent > indent) {
+        [value, next] = parseNode(lines, pos + 1, rawLines, anchors);
+      } else {
+        value = null;
+        next = pos + 1;
+      }
+    } else {
+      const restColumn = line.indent + 1 + (line.content.length - rest.length);
+      const synthetic: SourceLine = {
+        number: line.number,
+        raw: line.raw,
+        indent: restColumn - 1,
+        content: rest,
+        tabColumn: null,
+      };
+      const withSynthetic = lines.slice();
+      withSynthetic[pos] = synthetic;
+      [value, next] = parseNodeAt(withSynthetic, pos, restColumn - 1, rawLines, anchors);
+    }
+    anchors.set(anchorName, value);
+    return [value, next];
+  }
+
   if (isSeqMarker(line.content)) {
-    return parseSequence(lines, pos, indent, rawLines);
+    return parseSequence(lines, pos, indent, rawLines, anchors);
   }
   if (findTopLevelColon(line.content) !== -1) {
-    return parseMapping(lines, pos, indent, rawLines);
+    return parseMapping(lines, pos, indent, rawLines, anchors);
   }
   if (line.content[0] === '|' || line.content[0] === '>') {
     const header = parseBlockScalarHeader(line.content);
@@ -624,11 +682,79 @@ function parseNodeAt(lines: SourceLine[], pos: number, indent: number, rawLines:
   return [value, pos + 1];
 }
 
+function resolveAlias(
+  name: string,
+  line: number,
+  column: number,
+  raw: string,
+  anchors: Map<string, YamlValue>,
+): YamlValue {
+  if (!anchors.has(name)) {
+    throw new YamlParseError(`undefined alias "*${name}"`, line, column, raw);
+  }
+  return anchors.get(name)!;
+}
+
+// Parses value text that stands to the right of a mapping ":" or that has
+// already had a sequence "- " and any anchor prefix stripped off: an
+// anchor/alias, a block scalar header, or a plain/flow scalar. Unlike
+// parseNodeAt, this never re-enters block mapping/sequence parsing, since
+// text following ":" or "- " on the same line can't itself open a nested
+// block collection.
+function parseValueNode(
+  lines: SourceLine[],
+  pos: number,
+  line: SourceLine,
+  text: string,
+  column: number,
+  indent: number,
+  rawLines: string[],
+  anchors: Map<string, YamlValue>,
+): [YamlValue, number] {
+  const aliasMatch = ALIAS_RE.exec(text);
+  if (aliasMatch) {
+    return [resolveAlias(aliasMatch[1], line.number, column, line.raw, anchors), pos + 1];
+  }
+
+  const anchorMatch = ANCHOR_RE.exec(text);
+  if (anchorMatch) {
+    const anchorName = anchorMatch[1];
+    const rest = anchorMatch[2];
+    let value: YamlValue;
+    let next: number;
+    if (rest === undefined) {
+      if (pos + 1 < lines.length && lines[pos + 1].indent > indent) {
+        [value, next] = parseNode(lines, pos + 1, rawLines, anchors);
+      } else {
+        value = null;
+        next = pos + 1;
+      }
+    } else {
+      const restColumn = column + (text.length - rest.length);
+      [value, next] = parseValueNode(lines, pos, line, rest, restColumn, indent, rawLines, anchors);
+    }
+    anchors.set(anchorName, value);
+    return [value, next];
+  }
+
+  if (text[0] === '|' || text[0] === '>') {
+    const header = parseBlockScalarHeader(text);
+    if (!header) {
+      throw new YamlParseError(`invalid block scalar header "${text}"`, line.number, column, line.raw);
+    }
+    const block = parseBlockScalar(rawLines, line.number, indent, header);
+    return [block.text, findLineIndexAfter(lines, pos + 1, block.lastLine)];
+  }
+
+  return [parseValueText(text, line.number, column, line.raw), pos + 1];
+}
+
 function parseSequence(
   lines: SourceLine[],
   pos: number,
   indent: number,
   rawLines: string[],
+  anchors: Map<string, YamlValue>,
 ): [YamlValue[], number] {
   const result: YamlValue[] = [];
   while (pos < lines.length && lines[pos].indent === indent && isSeqMarker(lines[pos].content)) {
@@ -642,7 +768,7 @@ function parseSequence(
     if (restTrimmed.length === 0) {
       pos++;
       if (pos < lines.length && lines[pos].indent > indent) {
-        const [value, next] = parseNode(lines, pos, rawLines);
+        const [value, next] = parseNode(lines, pos, rawLines, anchors);
         result.push(value);
         pos = next;
       } else {
@@ -651,36 +777,68 @@ function parseSequence(
       continue;
     }
 
-    if (findTopLevelColon(restTrimmed) !== -1) {
-      // "- key: value" — the mapping's first entry is inline with the dash;
-      // later entries are ordinary lines indented to line up under it.
-      const synthetic: SourceLine = {
-        number: line.number,
-        raw: line.raw,
-        indent: itemColumn - 1,
-        content: restTrimmed,
-        tabColumn: null,
-      };
-      const withSynthetic = lines.slice();
-      withSynthetic[pos] = synthetic;
-      const [value, next] = parseMapping(withSynthetic, pos, synthetic.indent, rawLines);
-      result.push(value);
-      pos = next;
-    } else if (restTrimmed[0] === '|' || restTrimmed[0] === '>') {
-      const header = parseBlockScalarHeader(restTrimmed);
-      if (!header) {
-        throw new YamlParseError(`invalid block scalar header "${restTrimmed}"`, line.number, itemColumn, line.raw);
-      }
-      const block = parseBlockScalar(rawLines, line.number, indent, header);
-      result.push(block.text);
-      pos = findLineIndexAfter(lines, pos + 1, block.lastLine);
-    } else {
-      const value = parseValueText(restTrimmed, line.number, itemColumn, line.raw);
-      result.push(value);
-      pos++;
-    }
+    const [value, next] = parseSequenceItem(lines, pos, line, restTrimmed, itemColumn, indent, rawLines, anchors);
+    result.push(value);
+    pos = next;
   }
   return [result, pos];
+}
+
+// Parses the text of a non-empty sequence item (after "- " and leading
+// spaces). Handles an anchor/alias prefix, then the "- key: value" inline
+// mapping shorthand, then falls back to a plain value node.
+function parseSequenceItem(
+  lines: SourceLine[],
+  pos: number,
+  line: SourceLine,
+  text: string,
+  column: number,
+  indent: number,
+  rawLines: string[],
+  anchors: Map<string, YamlValue>,
+): [YamlValue, number] {
+  const aliasMatch = ALIAS_RE.exec(text);
+  if (aliasMatch) {
+    return [resolveAlias(aliasMatch[1], line.number, column, line.raw, anchors), pos + 1];
+  }
+
+  const anchorMatch = ANCHOR_RE.exec(text);
+  if (anchorMatch) {
+    const anchorName = anchorMatch[1];
+    const rest = anchorMatch[2];
+    let value: YamlValue;
+    let next: number;
+    if (rest === undefined) {
+      if (pos + 1 < lines.length && lines[pos + 1].indent > indent) {
+        [value, next] = parseNode(lines, pos + 1, rawLines, anchors);
+      } else {
+        value = null;
+        next = pos + 1;
+      }
+    } else {
+      const restColumn = column + (text.length - rest.length);
+      [value, next] = parseSequenceItem(lines, pos, line, rest, restColumn, indent, rawLines, anchors);
+    }
+    anchors.set(anchorName, value);
+    return [value, next];
+  }
+
+  if (findTopLevelColon(text) !== -1) {
+    // "- key: value" — the mapping's first entry is inline with the dash;
+    // later entries are ordinary lines indented to line up under it.
+    const synthetic: SourceLine = {
+      number: line.number,
+      raw: line.raw,
+      indent: column - 1,
+      content: text,
+      tabColumn: null,
+    };
+    const withSynthetic = lines.slice();
+    withSynthetic[pos] = synthetic;
+    return parseMapping(withSynthetic, pos, synthetic.indent, rawLines, anchors);
+  }
+
+  return parseValueNode(lines, pos, line, text, column, indent, rawLines, anchors);
 }
 
 function parseMapping(
@@ -688,6 +846,7 @@ function parseMapping(
   pos: number,
   indent: number,
   rawLines: string[],
+  anchors: Map<string, YamlValue>,
 ): [Record<string, YamlValue>, number] {
   const result: Record<string, YamlValue> = {};
   const keyLocations = new Map<string, { line: number; column: number; raw: string }>();
@@ -729,7 +888,7 @@ function parseMapping(
     if (valueOffset === -1) {
       pos++;
       if (pos < lines.length && lines[pos].indent > indent) {
-        const [value, next] = parseNode(lines, pos, rawLines);
+        const [value, next] = parseNode(lines, pos, rawLines, anchors);
         result[key] = value;
         pos = next;
       } else {
@@ -740,20 +899,9 @@ function parseMapping(
 
     const valueText = afterColon.slice(valueOffset).replace(/\s+$/, '');
     const valueColumn = line.indent + colonIdx + 2 + valueOffset;
-
-    if (valueText[0] === '|' || valueText[0] === '>') {
-      const header = parseBlockScalarHeader(valueText);
-      if (!header) {
-        throw new YamlParseError(`invalid block scalar header "${valueText}"`, line.number, valueColumn, line.raw);
-      }
-      const block = parseBlockScalar(rawLines, line.number, indent, header);
-      result[key] = block.text;
-      pos = findLineIndexAfter(lines, pos + 1, block.lastLine);
-      continue;
-    }
-
-    result[key] = parseValueText(valueText, line.number, valueColumn, line.raw);
-    pos++;
+    const [value, next] = parseValueNode(lines, pos, line, valueText, valueColumn, indent, rawLines, anchors);
+    result[key] = value;
+    pos = next;
   }
 
   return [result, pos];
@@ -771,7 +919,8 @@ export function parseYaml(source: string): YamlValue {
     return null;
   }
 
-  const [value, next] = parseNode(lines, pos, rawLines);
+  const anchors = new Map<string, YamlValue>();
+  const [value, next] = parseNode(lines, pos, rawLines, anchors);
   let end = next;
   if (end < lines.length && lines[end].content === '...') {
     end++;

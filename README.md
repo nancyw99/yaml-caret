@@ -110,11 +110,16 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 - A single leading `---` document marker and a single trailing `...`
 - Block scalars, literal (`|`) and folded (`>`), with chomping indicators
   (`-` strip, `+` keep) and an explicit indentation indicator (e.g. `|2`)
+- Anchors (`&name`) and aliases (`*name`) on whole nodes — a mapping value,
+  a sequence item, or the document root. An alias resolves to the same
+  parsed value as its anchor; referencing an undefined alias is a parse
+  error with the usual line/column/caret
 
 ## What's not supported yet
 
 - Multi-line flow collections
-- Anchors and aliases (`&name`, `*name`)
+- Anchors on mapping keys, merge keys (`<<`), and aliases inside flow
+  collections
 - Multiple documents in one stream
 - Schema validation beyond "this is structurally valid YAML" — the parser
   checks syntax, not your application's shape
