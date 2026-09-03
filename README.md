@@ -90,6 +90,41 @@ The `line`, `column`, and `sourceLine` fields on `YamlParseError` are also
 available directly, if you want to build your own error UI instead of using
 the pre-formatted message.
 
+## Schema validation
+
+Parsing only checks that the input is well-formed YAML. `validateSchema`
+checks the parsed value against a shape you describe, and throws a
+`SchemaValidationError` naming the exact property that's wrong:
+
+```ts
+import { parseYaml, validateSchema, SchemaValidationError, type Schema } from './src/index';
+
+const configSchema: Schema = {
+  type: 'object',
+  required: ['name', 'port'],
+  properties: {
+    name: { type: 'string' },
+    port: { type: 'number' },
+    tags: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+const config = parseYaml('name: my-service\nport: "8080"\n');
+try {
+  validateSchema(config, configSchema);
+} catch (err) {
+  if (err instanceof SchemaValidationError) {
+    console.error(err.message); // expected number, got string (at $.port)
+  }
+}
+```
+
+Supported schema shapes: `string`, `number`, `boolean`, `null`, `array`,
+`object` (with `required` and `additionalProperties: false`), `enum`, and
+`union`. There's no line/column on these errors — the parser has already
+discarded source positions by the time a plain `YamlValue` exists — so
+errors instead carry a path like `$.database.port`.
+
 ## Command line
 
 ```sh
@@ -114,6 +149,8 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
   a sequence item, or the document root. An alias resolves to the same
   parsed value as its anchor; referencing an undefined alias is a parse
   error with the usual line/column/caret
+- Schema validation (`validateSchema`) on top of the parsed value: types,
+  required properties, enums, and unions, with path-based errors
 
 ## What's not supported yet
 
@@ -121,8 +158,6 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 - Anchors on mapping keys, merge keys (`<<`), and aliases inside flow
   collections
 - Multiple documents in one stream
-- Schema validation beyond "this is structurally valid YAML" — the parser
-  checks syntax, not your application's shape
 
 See the code comments in `src/parser.ts` for where these are cut off.
 

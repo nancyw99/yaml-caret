@@ -1,6 +1,8 @@
 export { parseYaml, YamlParseError } from './parser';
 export type { YamlValue, YamlScalar, YamlErrorNote } from './parser';
 export { stringifyYaml } from './printer';
+export { validateSchema, SchemaValidationError } from './schema';
+export type { Schema } from './schema';
 
 import { readFileSync } from 'node:fs';
 import { parseYaml, YamlParseError } from './parser';
