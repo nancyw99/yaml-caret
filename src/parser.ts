@@ -7,12 +7,13 @@
 // mapping value, a sequence item, or the document root. An anchor written
 // immediately before an inline "- key: value" sequence shorthand is also
 // handled. Not supported: anchors on mapping keys, merge keys ("<<"), and
-// aliases inside flow collections.
+// aliases inside flow collections. Anchors are scoped to the document they
+// appear in, per the spec, so a fresh anchor table is used for each
+// document in a multi-document stream.
 //
-// Deliberately out of scope for now: multi-document streams beyond a
-// single leading "---". That's a real YAML feature that a lot of config
-// files never touch; better to get the common 90% right with good
-// diagnostics than to half-support everything.
+// Multi-document streams ("---" separated) are supported via
+// parseYamlDocuments; parseYaml stays single-document and throws if the
+// source turns out to contain more than one.
 
 export type YamlScalar = string | number | boolean | null;
 export type YamlValue = YamlScalar | YamlValue[] | { [key: string]: YamlValue };
@@ -907,34 +908,79 @@ function parseMapping(
   return [result, pos];
 }
 
+interface DocumentResult {
+  value: YamlValue;
+  // The line holding this document's leading "---", if it had one. Every
+  // document past the first must have one, since that's what separates it
+  // from the document before it.
+  startLine: SourceLine | null;
+}
+
+// Splits the filtered line list into one or more documents, each parsed
+// with its own anchor table. A document starts at a "---" line (optional
+// for the first document) and ends at a "..." line, the next "---" line,
+// or end of input.
+function parseDocuments(lines: SourceLine[], rawLines: string[]): DocumentResult[] {
+  const documents: DocumentResult[] = [];
+  let pos = 0;
+
+  while (pos < lines.length) {
+    const startLine = lines[pos].content === '---' ? lines[pos] : null;
+    if (startLine) pos++;
+
+    const contentPos = pos;
+    let value: YamlValue;
+    if (pos >= lines.length || lines[pos].content === '...' || lines[pos].content === '---') {
+      value = null;
+    } else {
+      const anchors = new Map<string, YamlValue>();
+      const [v, next] = parseNode(lines, pos, rawLines, anchors);
+      value = v;
+      pos = next;
+    }
+    documents.push({ value, startLine });
+
+    if (pos < lines.length && lines[pos].content === '...') {
+      pos++;
+    }
+    if (pos < lines.length && lines[pos].content !== '---') {
+      const line = lines[pos];
+      const expectedColumn = contentPos < lines.length ? lines[contentPos].indent + 1 : line.indent + 1;
+      throw new YamlParseError(
+        `unexpected indentation: expected this line to align with column ${expectedColumn}`,
+        line.number,
+        line.indent + 1,
+        line.raw,
+      );
+    }
+  }
+
+  return documents;
+}
+
 export function parseYaml(source: string): YamlValue {
   const lines = toSourceLines(source);
   const rawLines = splitLines(source);
-  let pos = 0;
+  const documents = parseDocuments(lines, rawLines);
 
-  if (pos < lines.length && lines[pos].content === '---') {
-    pos++;
-  }
-  if (pos >= lines.length || lines[pos].content === '...') {
-    return null;
-  }
-
-  const anchors = new Map<string, YamlValue>();
-  const [value, next] = parseNode(lines, pos, rawLines, anchors);
-  let end = next;
-  if (end < lines.length && lines[end].content === '...') {
-    end++;
-  }
-
-  if (end < lines.length) {
-    const line = lines[end];
+  if (documents.length > 1) {
+    const second = documents[1].startLine!;
     throw new YamlParseError(
-      `unexpected indentation: expected this line to align with column ${lines[pos].indent + 1}`,
-      line.number,
-      line.indent + 1,
-      line.raw,
+      'multiple documents found; use parseYamlDocuments() to parse a multi-document stream',
+      second.number,
+      second.indent + 1,
+      second.raw,
     );
   }
 
-  return value;
+  return documents.length === 0 ? null : documents[0].value;
+}
+
+// Parses every document in a "---"-separated stream, in order. A stream
+// with no "---" markers at all is treated as a single document, same as
+// parseYaml.
+export function parseYamlDocuments(source: string): YamlValue[] {
+  const lines = toSourceLines(source);
+  const rawLines = splitLines(source);
+  return parseDocuments(lines, rawLines).map((doc) => doc.value);
 }

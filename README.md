@@ -90,6 +90,28 @@ The `line`, `column`, and `sourceLine` fields on `YamlParseError` are also
 available directly, if you want to build your own error UI instead of using
 the pre-formatted message.
 
+## Multi-document streams
+
+A source can contain more than one document, separated by `---`.
+`parseYaml` only ever returns one value, so it throws if it finds more than
+one; use `parseYamlDocuments` when the input might be a stream:
+
+```ts
+import { parseYamlDocuments } from './src/index';
+
+const docs = parseYamlDocuments(`
+name: first
+---
+name: second
+`);
+
+console.log(docs.length); // 2
+console.log(docs[1].name); // 'second'
+```
+
+Anchors and aliases are scoped to the document they appear in, so the same
+anchor name can be reused across documents in one stream.
+
 ## Schema validation
 
 Parsing only checks that the input is well-formed YAML. `validateSchema`
@@ -142,13 +164,15 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
   in double-quoted strings
 - `null`, `true`/`false`, integers, and floats, recognized by value
 - Comments (`#`, respecting quotes)
-- A single leading `---` document marker and a single trailing `...`
+- `---` document markers and a trailing `...` end marker
 - Block scalars, literal (`|`) and folded (`>`), with chomping indicators
   (`-` strip, `+` keep) and an explicit indentation indicator (e.g. `|2`)
 - Anchors (`&name`) and aliases (`*name`) on whole nodes — a mapping value,
   a sequence item, or the document root. An alias resolves to the same
   parsed value as its anchor; referencing an undefined alias is a parse
   error with the usual line/column/caret
+- Multiple `---`-separated documents in one stream, via
+  `parseYamlDocuments`, with anchors scoped per document
 - Schema validation (`validateSchema`) on top of the parsed value: types,
   required properties, enums, and unions, with path-based errors
 
@@ -157,7 +181,6 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 - Multi-line flow collections
 - Anchors on mapping keys, merge keys (`<<`), and aliases inside flow
   collections
-- Multiple documents in one stream
 
 See the code comments in `src/parser.ts` for where these are cut off.
 
