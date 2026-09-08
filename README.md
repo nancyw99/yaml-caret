@@ -184,6 +184,15 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 
 See the code comments in `src/parser.ts` for where these are cut off.
 
+## Tests
+
+```sh
+npm test
+```
+
+Runs against `node:test`, the runner built into Node itself — no extra
+dependency for this either.
+
 ## License
 
 MIT, see LICENSE.
