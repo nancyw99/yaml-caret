@@ -852,7 +852,13 @@ function parseMapping(
   const result: Record<string, YamlValue> = {};
   const keyLocations = new Map<string, { line: number; column: number; raw: string }>();
 
-  while (pos < lines.length && lines[pos].indent === indent && !isSeqMarker(lines[pos].content)) {
+  while (
+    pos < lines.length &&
+    lines[pos].indent === indent &&
+    !isSeqMarker(lines[pos].content) &&
+    lines[pos].content !== '---' &&
+    lines[pos].content !== '...'
+  ) {
     const line = lines[pos];
     checkNoTab(line);
     const colonIdx = findTopLevelColon(line.content);
