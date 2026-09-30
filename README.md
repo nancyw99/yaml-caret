@@ -171,6 +171,9 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
   a sequence item, or the document root. An alias resolves to the same
   parsed value as its anchor; referencing an undefined alias is a parse
   error with the usual line/column/caret
+- Merge keys in block mappings: `<<: *base`, or `<<:` followed by a block
+  sequence of aliases. Explicit keys override merged ones, and earlier
+  merged mappings override later ones
 - Multiple `---`-separated documents in one stream, via
   `parseYamlDocuments`, with anchors scoped per document
 - Schema validation (`validateSchema`) on top of the parsed value: types,
@@ -179,8 +182,7 @@ node dist/index.js format config.yaml   # re-prints as canonical YAML
 ## What's not supported yet
 
 - Multi-line flow collections
-- Anchors on mapping keys, merge keys (`<<`), and aliases inside flow
-  collections
+- Anchors on mapping keys and aliases inside flow collections
 
 See the code comments in `src/parser.ts` for where these are cut off.
 

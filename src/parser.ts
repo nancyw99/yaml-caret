@@ -6,8 +6,9 @@
 // Anchors (&name) and aliases (*name) are supported for whole nodes: a
 // mapping value, a sequence item, or the document root. An anchor written
 // immediately before an inline "- key: value" sequence shorthand is also
-// handled. Not supported: anchors on mapping keys, merge keys ("<<"), and
-// aliases inside flow collections. Anchors are scoped to the document they
+// handled. Merge keys ("<<: *base" or "<<:" over a block sequence of
+// aliases) are supported in block mappings. Not supported: anchors on
+// mapping keys and aliases inside flow collections. Anchors are scoped to the document they
 // appear in, per the spec, so a fresh anchor table is used for each
 // document in a multi-document stream.
 //
@@ -851,6 +852,7 @@ function parseMapping(
 ): [Record<string, YamlValue>, number] {
   const result: Record<string, YamlValue> = {};
   const keyLocations = new Map<string, { line: number; column: number; raw: string }>();
+  const merges: Record<string, YamlValue>[] = [];
 
   while (
     pos < lines.length &&
@@ -889,6 +891,13 @@ function parseMapping(
     }
     keyLocations.set(key, { line: line.number, column: keyColumn, raw: line.raw });
 
+    // Only a bare << is a merge key; a quoted "<<" is an ordinary string key.
+    const isMerge = key === '<<' && keyText[0] !== '"' && keyText[0] !== "'";
+    const store = (value: YamlValue): void => {
+      if (isMerge) addMergeSources(value, merges, line, keyColumn);
+      else result[key] = value;
+    };
+
     const afterColon = line.content.slice(colonIdx + 1);
     const valueOffset = afterColon.search(/\S/);
 
@@ -896,10 +905,10 @@ function parseMapping(
       pos++;
       if (pos < lines.length && lines[pos].indent > indent) {
         const [value, next] = parseNode(lines, pos, rawLines, anchors);
-        result[key] = value;
+        store(value);
         pos = next;
       } else {
-        result[key] = null;
+        store(null);
       }
       continue;
     }
@@ -907,11 +916,40 @@ function parseMapping(
     const valueText = afterColon.slice(valueOffset).replace(/\s+$/, '');
     const valueColumn = line.indent + colonIdx + 2 + valueOffset;
     const [value, next] = parseValueNode(lines, pos, line, valueText, valueColumn, indent, rawLines, anchors);
-    result[key] = value;
+    store(value);
     pos = next;
   }
 
+  // Merged keys are applied last so that an explicit key always wins,
+  // wherever it sits relative to the "<<" line. Among several merged
+  // mappings the earliest one wins, as the merge key type specifies.
+  for (const source of merges) {
+    for (const k of Object.keys(source)) {
+      if (!Object.prototype.hasOwnProperty.call(result, k)) result[k] = source[k];
+    }
+  }
+
   return [result, pos];
+}
+
+// Validates the value of a "<<" key: a mapping, or a sequence of mappings.
+function addMergeSources(
+  value: YamlValue,
+  merges: Record<string, YamlValue>[],
+  line: SourceLine,
+  column: number,
+): void {
+  const isMapping = (v: YamlValue): v is Record<string, YamlValue> =>
+    typeof v === 'object' && v !== null && !Array.isArray(v);
+  if (isMapping(value)) {
+    merges.push(value);
+    return;
+  }
+  if (Array.isArray(value) && value.every(isMapping)) {
+    merges.push(...(value as Record<string, YamlValue>[]));
+    return;
+  }
+  throw new YamlParseError('merge key "<<" needs a mapping or a sequence of mappings', line.number, column, line.raw);
 }
 
 interface DocumentResult {
